@@ -95,13 +95,14 @@ async def inspect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
     try:
         src = await _save_upload(file, job)
         legacy = _is_legacy_hindi(src)
-        ratio = _devanagari_ratio(src)
+        has_text = _has_text_layer(src)
+        ratio = _devanagari_ratio(src) if has_text else 0.0
         fonts = sorted(_pdf_font_names(src))[:20]
         _cleanup(job)
-        return JSONResponse({"legacy_hindi": legacy, "devanagari_ratio": ratio, "fonts": fonts})
+        return JSONResponse({"legacy_hindi": legacy, "has_text": has_text, "devanagari_ratio": ratio, "fonts": fonts})
     except Exception:
         _cleanup(job)
-        return JSONResponse({"legacy_hindi": False, "devanagari_ratio": 0.0, "fonts": []})
+        return JSONResponse({"legacy_hindi": False, "has_text": False, "devanagari_ratio": 0.0, "fonts": []})
 
 
 # ---------- Office / HTML -> PDF ----------

@@ -90,11 +90,19 @@ const EditPdfPage = () => {
     setPageIndex(0); setEdits({}); setSelectedId(null); setResult(null); setZoom(1);
     setObjects([]); setSelectedObjId(null);
     // Ask the backend whether this PDF uses a legacy (non-Unicode) Hindi font.
+    // Mirror the pdf_to_word fallback: convert Kruti/DevLys ASCII text to Unicode
+    // when the font is a known legacy one OR the text layer is non-empty yet has
+    // almost no real Devanagari (devanagari_ratio < 0.15) — a strong signal of a
+    // legacy encoding even when the font name isn't in our known list.
     let legacy = false;
     try {
       const fd = new FormData(); fd.append('file', f);
       const r = await fetch(`${BACKEND}/api/pdf/inspect`, { method: 'POST', body: fd });
-      if (r.ok) { const d = await r.json(); legacy = !!d.legacy_hindi; }
+      if (r.ok) {
+        const d = await r.json();
+        const ratio = typeof d.devanagari_ratio === 'number' ? d.devanagari_ratio : 0;
+        legacy = !!d.legacy_hindi || (!!d.has_text && ratio < 0.15);
+      }
     } catch (e) { /* detection optional */ }
     setLegacyHindi(legacy);
     await loadPage(f, 0, legacy);
