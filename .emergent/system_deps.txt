@@ -1,4 +1,6 @@
 cron=3.0pl1-162
+fonts-deva=2:1.4
+fonts-lohit-deva=2.95.4-5
 ghostscript=10.0.0~dfsg-11+deb12u8
 libreoffice-calc=4:7.4.7-1+deb12u14
 libreoffice-impress=4:7.4.7-1+deb12u14

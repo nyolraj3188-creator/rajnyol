@@ -29,6 +29,18 @@ const FAMILIES = [
 ];
 const famCss = (id) => (FAMILIES.find((f) => f.id === id) || FAMILIES[0]).css;
 
+// Measure how wide a string renders (CSS px) for the given style, so an edited
+// line — especially converted Devanagari, which is wider than the original
+// ASCII/Latin glyphs — can be shrunk to fit its original box instead of
+// overflowing onto the next column / line.
+let _measureCanvas = null;
+const measureTextWidthPx = (text, sizePx, st) => {
+  if (!_measureCanvas) _measureCanvas = document.createElement('canvas');
+  const ctx = _measureCanvas.getContext('2d');
+  ctx.font = `${st.italic ? 'italic ' : ''}${st.bold ? '700' : '400'} ${sizePx}px ${famCss(st.family)}`;
+  return ctx.measureText(text || '').width;
+};
+
 const StyleToggle = ({ active, onClick, title, children }) => (
   <button type="button" onClick={onClick} title={title}
     className={`grid place-items-center w-9 h-9 rounded-lg border transition-colors ${active ? 'bg-rose-500 border-rose-500 text-white' : 'border-slate-200 dark:border-white/10 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/5'}`}>
@@ -471,11 +483,27 @@ const EditPdfPage = () => {
                         const st = entry ? entry.style : deriveStyle(it);
                         const text = entry ? entry.text : it.str;
                         const active = selectedId === it.id || (entry && entry.touched);
-                        const fontPx = st.size * scale;
+                        // Keep the on-page glyph size IDENTICAL to the original when
+                        // the user hasn't manually changed the size: st.size starts as
+                        // the rounded point size, so scale the exact original pixel
+                        // height (it.fontPx) by (current size / baseline size). When
+                        // unchanged this factor is 1 -> no size jump on click/edit.
+                        const baseSize = Math.max(6, Math.round(it.sizePt));
+                        let fontPx = it.fontPx * (st.size / baseSize);
+                        // Shrink-to-fit: if the (edited/converted) text is wider than
+                        // its original box, reduce the font size so it fits instead of
+                        // overflowing. Only shrinks — never enlarges — so text that
+                        // already fits keeps its exact original size.
+                        if (it.widthPx > 4) {
+                          const measured = measureTextWidthPx(text, fontPx * 0.92, st);
+                          if (measured > it.widthPx) {
+                            fontPx = Math.max(5, fontPx * (it.widthPx / measured));
+                          }
+                        }
                         const baselinePx = it.top + it.fontPx;
                         const top = baselinePx - fontPx;
                         if (active) {
-                          const w = Math.max(it.widthPx, (text.length + 1) * fontPx * 0.5, 14);
+                          const w = Math.max(it.widthPx, fontPx, 14);
                           return (
                             <input key={it.id} value={text}
                               onChange={(e) => patchText(it.id, e.target.value)}
