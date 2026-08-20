@@ -141,6 +141,7 @@ def _ocr_if_scanned(src: Path, job: Path, lang: str = "eng") -> Path:
     """If the PDF is image-only (scanned), OCR it so downstream converters see text."""
     if _has_text_layer(src):
         return src
+    _require_ocr_tools()
     import ocrmypdf
     ocred = job / (src.stem + "_ocred.pdf")
     try:
@@ -155,6 +156,7 @@ def _ocr_if_scanned(src: Path, job: Path, lang: str = "eng") -> Path:
 def _scanned_pdf_to_docx(src: Path, job: Path, out: Path, lang: str):
     """OCR a scanned PDF and build an editable Word document from the recognized text."""
     import re
+    _require_ocr_tools()
     import ocrmypdf
     from docx import Document
     sidecar = job / "ocr_text.txt"
@@ -177,13 +179,80 @@ def _scanned_pdf_to_docx(src: Path, job: Path, out: Path, lang: str):
     doc.save(str(out))
 
 
-def _docx_is_valid(path: Path) -> bool:
+def _require_ocr_tools():
+    """Ensure the OCR toolchain (Tesseract + Ghostscript) is available on PATH."""
+    missing = [t for t in ("tesseract", "gs") if shutil.which(t) is None]
+    if missing:
+        raise HTTPException(
+            503,
+            "OCR is temporarily unavailable on the server (missing: "
+            + ", ".join(missing) + "). Please try again shortly.",
+        )
+
+
+def _zip_has_parts(path: Path, required: list) -> bool:
+    """A valid OOXML file is a zip that contains the required internal parts
+    and is not corrupt."""
+    import zipfile
     try:
-        from docx import Document
-        Document(str(path))
+        if not path.exists() or path.stat().st_size < 200:
+            return False
+        if not zipfile.is_zipfile(str(path)):
+            return False
+        with zipfile.ZipFile(str(path)) as z:
+            names = set(z.namelist())
+            if not set(required).issubset(names):
+                return False
+            if z.testzip() is not None:  # first corrupt member, if any
+                return False
         return True
     except Exception:
         return False
+
+
+def _docx_is_valid(path: Path) -> bool:
+    """Strict validity check so we never hand back a file Word refuses to open."""
+    if not _zip_has_parts(path, ["[Content_Types].xml", "word/document.xml"]):
+        return False
+    try:
+        from docx import Document
+        doc = Document(str(path))
+        # touch the body so a structurally-broken document raises here
+        _ = doc.paragraphs
+        return True
+    except Exception:
+        return False
+
+
+def _xlsx_is_valid(path: Path) -> bool:
+    """Strict validity check for Excel output."""
+    if not _zip_has_parts(path, ["[Content_Types].xml", "xl/workbook.xml"]):
+        return False
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(str(path), read_only=True)
+        _ = wb.sheetnames
+        wb.close()
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_office(src: Path, ext: str, job: Path) -> Path:
+    """Re-save an Office file through headless LibreOffice so it opens cleanly
+    in Microsoft Word / Excel. Returns the normalized file, or the original if
+    LibreOffice is unavailable or the round-trip fails."""
+    if shutil.which("soffice") is None:
+        return src
+    try:
+        norm_dir = job / f"norm_{ext}"
+        norm_dir.mkdir(exist_ok=True)
+        produced = _libreoffice(src, ext, norm_dir)
+        final = job / (src.stem + "_ms." + ext)
+        shutil.copy(str(produced), str(final))
+        return final
+    except Exception:
+        return src
 
 
 # ---------- PDF -> Word ----------
@@ -208,6 +277,10 @@ async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File
             _scanned_pdf_to_docx(src, job, out, lang)
         if not out.exists() or not _docx_is_valid(out):
             raise HTTPException(500, "Conversion produced an unreadable document. Please try another file.")
+        # Normalize through LibreOffice so the .docx opens cleanly in MS Word.
+        final = _normalize_office(out, "docx", job)
+        if _docx_is_valid(final):
+            out = final
         return _respond(out, src.stem + ".docx", "docx", job, background_tasks)
     except HTTPException:
         _cleanup(job); raise
@@ -245,6 +318,12 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
             wb.create_sheet("Sheet1")
         out = job / (src.stem + ".xlsx")
         wb.save(str(out))
+        if not _xlsx_is_valid(out):
+            raise HTTPException(500, "Conversion produced an unreadable spreadsheet. Please try another file.")
+        # Normalize through LibreOffice so the .xlsx opens cleanly in MS Excel.
+        final = _normalize_office(out, "xlsx", job)
+        if _xlsx_is_valid(final):
+            out = final
         return _respond(out, src.stem + ".xlsx", "xlsx", job, background_tasks)
     except Exception as e:
         _cleanup(job); raise HTTPException(500, f"PDF to Excel failed: {e}")
@@ -286,6 +365,7 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
     import ocrmypdf
     job = _new_job()
     try:
+        _require_ocr_tools()
         src = await _save_upload(file, job)
         out = job / (src.stem + "_ocr.pdf")
         try:
