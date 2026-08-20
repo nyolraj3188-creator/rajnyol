@@ -90,10 +90,12 @@ const EditPdfPage = () => {
     setPageIndex(0); setEdits({}); setSelectedId(null); setResult(null); setZoom(1);
     setObjects([]); setSelectedObjId(null);
     // Ask the backend whether this PDF uses a legacy (non-Unicode) Hindi font.
-    // Mirror the pdf_to_word fallback: convert Kruti/DevLys ASCII text to Unicode
-    // when the font is a known legacy one OR the text layer is non-empty yet has
-    // almost no real Devanagari (devanagari_ratio < 0.15) — a strong signal of a
-    // legacy encoding even when the font name isn't in our known list.
+    // Content-based auto-detection: convert Kruti/DevLys ASCII text to Unicode when
+    // the font is a known legacy one, OR the text layer is non-empty yet has almost
+    // no real Devanagari (devanagari_ratio < 0.15) — a strong signal of a legacy
+    // encoding even when the font name isn't in our known list. A safeguard skips
+    // genuine English PDFs (which also have ~0 Devanagari) so their text isn't
+    // garbled by the Kruti->Unicode mapping.
     let legacy = false;
     try {
       const fd = new FormData(); fd.append('file', f);
@@ -101,7 +103,7 @@ const EditPdfPage = () => {
       if (r.ok) {
         const d = await r.json();
         const ratio = typeof d.devanagari_ratio === 'number' ? d.devanagari_ratio : 0;
-        legacy = !!d.legacy_hindi || (!!d.has_text && ratio < 0.15);
+        legacy = !!d.legacy_hindi || (!!d.has_text && ratio < 0.15 && !d.looks_english);
       }
     } catch (e) { /* detection optional */ }
     setLegacyHindi(legacy);
