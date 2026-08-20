@@ -59,3 +59,13 @@ ilovepdf-style PDF tools website (repo: sanjusaharan10704-svg/LOVEPDF). Bug fix 
 - P1: Edit PDF v2 — add-new-text-box + delete/whiteout regions; true text removal
 - P2: Deployment guide — Railway/Render Docker image, MongoDB Atlas, lovepdf.co.in DNS (A/CNAME + api subdomain), SSL
 - P2: Replace mock stats/reviews or label as "sample"
+
+## Aug 2025 — Admin panel integration + PDF/Hindi fixes (this session)
+- Recreated missing backend/.env + frontend/.env (app was down). DB_NAME=lovepdf_db.
+- ADMIN PANEL integrated from GitHub repo LOVEPDFDEV2026 (SEO + Blog CMS, JWT): backend/seo_admin.py wired in server.py (startup ensure_default_admin). Frontend: /admin/login, /admin dashboard (Pages SEO / Site & Analytics / Blog / Account), Blog + BlogPost pages, SeoContext + Seo component. Creds admin@lovepdf.com / Admin@12345 (backend/.env ADMIN_EMAIL/ADMIN_PASSWORD/ADMIN_JWT_SECRET). Backend 21/21 tests pass. NOTE: deployment env must also set these 3 admin vars.
+- SYSTEM TOOLS installed + persisted in .emergent/system_deps.txt: ghostscript, tesseract-ocr(+eng,+hin,+script-deva), poppler-utils, libreoffice(writer/calc/impress), qpdf, unpaper, fonts-lohit-deva. /api/pdf/health now all true.
+- PDF CONVERSION hardening (pdf_tools.py): strict _docx_is_valid + _xlsx_is_valid; LibreOffice normalize (_normalize_office) so Word/Excel open cleanly in MS Office; _sanitize_lang; OCR quality via unpaper clean+deskew (_run_ocr).
+- HINDI: pdf-to-word 3-tier (pdf2docx -> Unicode text-layer -> OCR). LEGACY (Kruti Dev/DevLys) fonts: deterministic ASCII->Unicode converter (backend/krutidev.py + krutidev_map.json, Python port byte-identical to vendored JS frontend/src/lib/krutidev). Applied to pdf-to-word AND pdf-to-excel. New POST /api/pdf/inspect {legacy_hindi,devanagari_ratio,fonts}. EditPdfPage now calls /inspect and converts legacy text runs to Unicode for display/edit.
+- BUG FIX: /api/image/remove-bg (rembg) was 500 due to missing pymatting/pooch/scikit-image — installed + added to requirements.txt. Fixes SignPage "Image" tab + Remove Background tool.
+- ToolPage.jsx merged from LOVEPDFDEV2026: state clears on tool switch; improved multi-file preview grid (thumbnails, numbered badges, drag-to-reorder, inline Add-more) for Merge/JPG-to-PDF. Edit PDF, Sign PDF, image_tools (keyless rembg) preserved.
+- KNOWN: Editing Hindi text and SAVING via Edit PDF export uses pdf-lib standard fonts (no Devanagari embedding) — display/edit is fixed, but exporting edited Devanagari into the PDF needs a future embedded-font step. OCR of dotted form-lines can still add minor noise (legacy PDFs now use the clean deterministic converter instead).

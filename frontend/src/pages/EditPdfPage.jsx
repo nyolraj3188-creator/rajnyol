@@ -10,6 +10,9 @@ import Header from '../components/Header';
 import Footer from '../components/Footer';
 import FileDrop from '../components/FileDrop';
 import * as pdf from '../lib/pdfUtils';
+import { krutiToUnicode } from '../lib/krutidev';
+
+const BACKEND = process.env.REACT_APP_BACKEND_URL;
 
 const TABS = [
   { id: 'annotate', label: 'Annotate', icon: StickyNote },
@@ -60,14 +63,20 @@ const EditPdfPage = () => {
   const [error, setError] = useState('');
   const [objects, setObjects] = useState([]); // {id, kind:'shape'|'image', pageIndex, n, ...}
   const [selectedObjId, setSelectedObjId] = useState(null);
+  const [legacyHindi, setLegacyHindi] = useState(false);
   const stageRef = useRef(null);
   const objDrag = useRef(null);
   const imgInputRef = useRef(null);
 
-  const loadPage = useCallback(async (f, idx) => {
+  const loadPage = useCallback(async (f, idx, convert = false) => {
     setLoading(true); setError('');
     try {
       const p = await pdf.extractPageText(f, idx, 780);
+      // Legacy (Kruti Dev / DevLys) PDFs store Hindi as ASCII-mapped codes; convert
+      // each run to real Unicode Devanagari so it displays & edits correctly.
+      if (convert && p.items) {
+        p.items = p.items.map((it) => ({ ...it, str: krutiToUnicode(it.str) }));
+      }
       setPreview(p); setTotal(p.total);
     } catch (e) {
       setError('Could not read this PDF. It may be scanned (image-only) or password protected.');
@@ -80,7 +89,15 @@ const EditPdfPage = () => {
     setFile(f); setDocName(f.name || 'document.pdf');
     setPageIndex(0); setEdits({}); setSelectedId(null); setResult(null); setZoom(1);
     setObjects([]); setSelectedObjId(null);
-    await loadPage(f, 0);
+    // Ask the backend whether this PDF uses a legacy (non-Unicode) Hindi font.
+    let legacy = false;
+    try {
+      const fd = new FormData(); fd.append('file', f);
+      const r = await fetch(`${BACKEND}/api/pdf/inspect`, { method: 'POST', body: fd });
+      if (r.ok) { const d = await r.json(); legacy = !!d.legacy_hindi; }
+    } catch (e) { /* detection optional */ }
+    setLegacyHindi(legacy);
+    await loadPage(f, 0, legacy);
     try {
       const t = await pdf.renderThumbnails(f, 60, 0.28);
       setThumbs(t.thumbs); setTotal(t.total);
@@ -90,7 +107,7 @@ const EditPdfPage = () => {
   const goPage = async (idx) => {
     if (idx === pageIndex || idx < 0 || idx >= total) return;
     setSelectedId(null); setPageIndex(idx);
-    await loadPage(file, idx);
+    await loadPage(file, idx, legacyHindi);
   };
 
   const selectItem = (it) => {

@@ -1,513 +1,560 @@
 #!/usr/bin/env python3
 """
-Backend API tests for Admin Panel (SEO + Blog CMS)
-Tests all endpoints in /app/backend/seo_admin.py
+Comprehensive backend testing for:
+- PART A: Background removal (POST /api/image/remove-bg)
+- PART B: Legacy Kruti Dev -> Unicode conversion (pdf-to-word, pdf-to-excel, inspect)
 """
-import requests
-import json
+import os
 import sys
+import io
+import requests
+from pathlib import Path
 
-# Backend URL from frontend/.env
-BASE_URL = "https://abced79c-6e9c-40cc-8d66-2e065bc1abab.preview.emergentagent.com/api"
+# Get backend URL from frontend .env
+BACKEND_URL = None
+env_file = Path("/app/frontend/.env")
+if env_file.exists():
+    for line in env_file.read_text().splitlines():
+        if line.startswith("REACT_APP_BACKEND_URL="):
+            BACKEND_URL = line.split("=", 1)[1].strip()
+            break
 
-# Admin credentials from /app/memory/test_credentials.md
-ADMIN_EMAIL = "admin@lovepdf.com"
-ADMIN_PASSWORD = "Admin@12345"
+if not BACKEND_URL:
+    print("❌ ERROR: Could not find REACT_APP_BACKEND_URL in /app/frontend/.env")
+    sys.exit(1)
 
-# Test results tracking
-passed = 0
-failed = 0
-test_results = []
+print(f"🔗 Testing backend at: {BACKEND_URL}")
+print("=" * 80)
 
-def log_test(name, success, details=""):
-    global passed, failed
-    if success:
-        passed += 1
-        status = "✅ PASS"
+# Test counters
+total_tests = 0
+passed_tests = 0
+failed_tests = 0
+
+def test_result(name, passed, details=""):
+    global total_tests, passed_tests, failed_tests
+    total_tests += 1
+    if passed:
+        passed_tests += 1
+        print(f"✅ {name}")
+        if details:
+            print(f"   {details}")
     else:
-        failed += 1
-        status = "❌ FAIL"
-    msg = f"{status}: {name}"
-    if details:
-        msg += f" - {details}"
-    print(msg)
-    test_results.append({"name": name, "success": success, "details": details})
+        failed_tests += 1
+        print(f"❌ {name}")
+        if details:
+            print(f"   {details}")
+    print()
 
-def test_auth():
-    """Test authentication endpoints"""
-    print("\n" + "="*60)
-    print("1. TESTING AUTH ENDPOINTS")
-    print("="*60)
+# ============================================================================
+# PART A: Background Removal
+# ============================================================================
+print("\n" + "=" * 80)
+print("PART A: BACKGROUND REMOVAL FIX (POST /api/image/remove-bg)")
+print("=" * 80 + "\n")
+
+def test_background_removal():
+    """Test POST /api/image/remove-bg with a simple image"""
+    from PIL import Image
     
-    token = None
+    # Create a simple test image (red square on white background)
+    img = Image.new('RGB', (200, 200), color='white')
+    # Draw a red square in the center
+    for x in range(50, 150):
+        for y in range(50, 150):
+            img.putpixel((x, y), (255, 0, 0))
     
-    # Test 1: Login with correct credentials
+    # Save to bytes
+    img_bytes = io.BytesIO()
+    img.save(img_bytes, format='PNG')
+    img_bytes.seek(0)
+    
     try:
-        resp = requests.post(f"{BASE_URL}/admin/login", json={
-            "email": ADMIN_EMAIL,
-            "password": ADMIN_PASSWORD
-        }, timeout=10)
+        # POST to remove-bg endpoint
+        url = f"{BACKEND_URL}/api/image/remove-bg"
+        files = {'file': ('test_image.png', img_bytes, 'image/png')}
+        response = requests.post(url, files=files, timeout=60)
         
-        if resp.status_code == 200:
-            data = resp.json()
-            if "access_token" in data and "email" in data:
-                token = data["access_token"]
-                log_test("POST /api/admin/login (correct creds)", True, f"Got token, email={data['email']}")
-            else:
-                log_test("POST /api/admin/login (correct creds)", False, "Missing access_token or email in response")
-        else:
-            log_test("POST /api/admin/login (correct creds)", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("POST /api/admin/login (correct creds)", False, str(e))
-    
-    # Test 2: Login with wrong password
-    try:
-        resp = requests.post(f"{BASE_URL}/admin/login", json={
-            "email": ADMIN_EMAIL,
-            "password": "WrongPassword123"
-        }, timeout=10)
+        # Check HTTP status
+        if response.status_code != 200:
+            test_result(
+                "Background removal - HTTP 200",
+                False,
+                f"Expected 200, got {response.status_code}: {response.text[:200]}"
+            )
+            return
         
-        if resp.status_code == 401:
-            log_test("POST /api/admin/login (wrong password)", True, "Correctly returned 401")
-        else:
-            log_test("POST /api/admin/login (wrong password)", False, f"Expected 401, got {resp.status_code}")
-    except Exception as e:
-        log_test("POST /api/admin/login (wrong password)", False, str(e))
-    
-    # Test 3: GET /admin/me WITHOUT token
-    try:
-        resp = requests.get(f"{BASE_URL}/admin/me", timeout=10)
-        if resp.status_code == 401:
-            log_test("GET /api/admin/me (without token)", True, "Correctly returned 401")
-        else:
-            log_test("GET /api/admin/me (without token)", False, f"Expected 401, got {resp.status_code}")
-    except Exception as e:
-        log_test("GET /api/admin/me (without token)", False, str(e))
-    
-    # Test 4: GET /admin/me WITH token
-    if token:
+        test_result("Background removal - HTTP 200", True, f"Status: {response.status_code}")
+        
+        # Check response is a valid PNG
+        content = response.content
+        if not content.startswith(b'\x89PNG'):
+            test_result(
+                "Background removal - Valid PNG signature",
+                False,
+                f"Response does not start with PNG signature. First 10 bytes: {content[:10]}"
+            )
+            return
+        
+        test_result(
+            "Background removal - Valid PNG signature",
+            True,
+            f"Response starts with PNG signature (\\x89PNG)"
+        )
+        
+        # Check size > 100 bytes
+        size = len(content)
+        if size <= 100:
+            test_result(
+                "Background removal - Size > 100 bytes",
+                False,
+                f"Response size is {size} bytes (expected > 100)"
+            )
+            return
+        
+        test_result(
+            "Background removal - Size > 100 bytes",
+            True,
+            f"Response size: {size} bytes"
+        )
+        
+        # Verify it's a valid PNG by loading with PIL
         try:
-            me_resp = requests.get(f"{BASE_URL}/admin/me", 
-                                  headers={"Authorization": f"Bearer {token}"},
-                                  timeout=10)
-            if me_resp.status_code == 200:
-                me_data = me_resp.json()
-                if "email" in me_data:
-                    log_test("GET /api/admin/me (with token)", True, f"email={me_data['email']}")
-                else:
-                    log_test("GET /api/admin/me (with token)", False, "Missing email in response")
-            else:
-                log_test("GET /api/admin/me (with token)", False, f"Status {me_resp.status_code}: {me_resp.text}")
+            result_img = Image.open(io.BytesIO(content))
+            result_img.verify()
+            test_result(
+                "Background removal - PIL can load result",
+                True,
+                f"Image format: {result_img.format}, size: {result_img.size}"
+            )
         except Exception as e:
-            log_test("GET /api/admin/me (with token)", False, str(e))
+            test_result(
+                "Background removal - PIL can load result",
+                False,
+                f"PIL failed to load: {e}"
+            )
+        
+    except Exception as e:
+        test_result("Background removal - Request", False, f"Exception: {e}")
+
+test_background_removal()
+
+# ============================================================================
+# PART B: Legacy Kruti Dev -> Unicode Conversion
+# ============================================================================
+print("\n" + "=" * 80)
+print("PART B: LEGACY KRUTI DEV -> UNICODE CONVERSION")
+print("=" * 80 + "\n")
+
+def create_kruti_dev_pdf():
+    """
+    Create a PDF that simulates a real Kruti Dev PDF:
+    - Font name contains 'KrutiDev010' (legacy token)
+    - Text layer contains ASCII codes (genuine Kruti Dev encoding)
+    """
+    from fpdf import FPDF
+    import re
+    
+    # Create PDF with custom font name
+    pdf = FPDF()
+    
+    # Register the Lohit Devanagari font under the name 'KrutiDev010'
+    # This simulates a legacy font name while using a real Unicode font
+    font_path = '/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf'
+    if not Path(font_path).exists():
+        raise FileNotFoundError(f"Font not found: {font_path}")
+    
+    pdf.add_font('KrutiDev010', '', font_path, uni=True)
+    pdf.add_page()
+    pdf.set_font('KrutiDev010', size=20)
+    
+    # Write EXACT ASCII lines (genuine Kruti Dev encoding)
+    # These should convert to real Devanagari
+    kruti_lines = [
+        'pfj= izek.k i=',
+        'izekf.kr fd;k tkrk gS fd Jh@dqekjh@Jherh',
+        'O;fäxr :i ls ekg@o"kksZa ls tkurk@tkurh gwi rFkk tgki rd esjl',
+        'budk uSfrd pfj= mmke gSA'
+    ]
+    
+    for line in kruti_lines:
+        pdf.cell(0, 10, txt=line, ln=True)
+    
+    # Save to bytes
+    pdf_bytes = pdf.output()
+    if isinstance(pdf_bytes, str):
+        pdf_bytes = pdf_bytes.encode('latin-1')
+    
+    # Manually patch the PDF to inject the legacy font name
+    # Replace the auto-generated font name with 'KrutiDev010'
+    pdf_str = pdf_bytes.decode('latin-1', errors='ignore')
+    # Find and replace the font name in the PDF structure
+    # fpdf2 generates names like 'MPDFAA+LohitDevanagari'
+    pdf_str = re.sub(r'/BaseFont\s*/[A-Z]+\+LohitDevanagari', '/BaseFont /KrutiDev010', pdf_str)
+    pdf_str = re.sub(r'/FontName\s*/[A-Z]+\+LohitDevanagari', '/FontName /KrutiDev010', pdf_str)
+    pdf_bytes = pdf_str.encode('latin-1', errors='ignore')
+    
+    return pdf_bytes
+
+def has_devanagari(text):
+    """Check if text contains Devanagari Unicode characters (U+0900-U+097F)"""
+    if not text:
+        return False
+    return any('\u0900' <= c <= '\u097f' for c in text)
+
+def count_devanagari(text):
+    """Count Devanagari Unicode characters"""
+    if not text:
+        return 0
+    return sum(1 for c in text if '\u0900' <= c <= '\u097f')
+
+def extract_docx_text(docx_bytes):
+    """Extract text from .docx bytes"""
+    from docx import Document
+    doc = Document(io.BytesIO(docx_bytes))
+    return '\n'.join(p.text for p in doc.paragraphs)
+
+def extract_xlsx_text(xlsx_bytes):
+    """Extract all cell text from .xlsx bytes"""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(xlsx_bytes))
+    text_parts = []
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.value:
+                    text_parts.append(str(cell.value))
+    return '\n'.join(text_parts)
+
+# Test 1: PDF to Word with legacy Kruti Dev
+print("Test 1: POST /api/pdf/pdf-to-word with legacy Kruti Dev PDF")
+print("-" * 80)
+
+try:
+    pdf_bytes = create_kruti_dev_pdf()
+    print(f"✓ Created Kruti Dev PDF ({len(pdf_bytes)} bytes)")
+    
+    url = f"{BACKEND_URL}/api/pdf/pdf-to-word"
+    files = {'file': ('kruti_test.pdf', io.BytesIO(pdf_bytes), 'application/pdf')}
+    response = requests.post(url, files=files, timeout=120)
+    
+    if response.status_code != 200:
+        test_result(
+            "Kruti Dev PDF to Word - HTTP 200",
+            False,
+            f"Expected 200, got {response.status_code}: {response.text[:300]}"
+        )
     else:
-        log_test("GET /api/admin/me (with token)", False, "No token available from login")
-    
-    return token  # Return token for subsequent tests
-
-def test_seo_pages(token):
-    """Test SEO pages CRUD endpoints"""
-    print("\n" + "="*60)
-    print("2. TESTING SEO PAGES ENDPOINTS")
-    print("="*60)
-    
-    if not token:
-        log_test("SEO Pages tests", False, "No auth token available")
-        return
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    # Test 1: PUT /api/admin/seo/pages (upsert)
-    try:
-        resp = requests.put(f"{BASE_URL}/admin/seo/pages", 
-                           headers=headers,
-                           json={
-                               "path": "/tool/merge-pdf",
-                               "title": "Test Merge PDF",
-                               "description": "Test description",
-                               "keywords": "merge, pdf, test"
-                           },
-                           timeout=10)
+        test_result("Kruti Dev PDF to Word - HTTP 200", True)
         
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("ok") and data.get("path") == "/tool/merge-pdf":
-                log_test("PUT /api/admin/seo/pages", True, "SEO page saved")
-            else:
-                log_test("PUT /api/admin/seo/pages", False, f"Unexpected response: {data}")
+        # Check it's a valid .docx
+        docx_bytes = response.content
+        if len(docx_bytes) < 1000:
+            test_result(
+                "Kruti Dev PDF to Word - Valid non-empty .docx",
+                False,
+                f"Response too small: {len(docx_bytes)} bytes"
+            )
         else:
-            log_test("PUT /api/admin/seo/pages", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("PUT /api/admin/seo/pages", False, str(e))
-    
-    # Test 2: GET /api/admin/seo/pages (list)
-    try:
-        resp = requests.get(f"{BASE_URL}/admin/seo/pages", headers=headers, timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if "pages" in data:
-                pages = data["pages"]
-                found = any(p.get("path") == "/tool/merge-pdf" for p in pages)
-                if found:
-                    log_test("GET /api/admin/seo/pages", True, f"Found saved path in list ({len(pages)} pages)")
-                else:
-                    log_test("GET /api/admin/seo/pages", False, "Saved path not found in list")
-            else:
-                log_test("GET /api/admin/seo/pages", False, "Missing 'pages' in response")
-        else:
-            log_test("GET /api/admin/seo/pages", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/admin/seo/pages", False, str(e))
-    
-    # Test 3: Public GET /api/seo/page
-    try:
-        resp = requests.get(f"{BASE_URL}/seo/page?path=/tool/merge-pdf", timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if "seo" in data and data["seo"]:
-                seo = data["seo"]
-                if seo.get("title") == "Test Merge PDF":
-                    log_test("GET /api/seo/page (public)", True, "SEO data reflects saved title")
-                else:
-                    log_test("GET /api/seo/page (public)", False, f"Title mismatch: {seo.get('title')}")
-            else:
-                log_test("GET /api/seo/page (public)", False, "No SEO data returned")
-        else:
-            log_test("GET /api/seo/page (public)", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/seo/page (public)", False, str(e))
-
-def test_site_settings(token):
-    """Test site settings endpoints"""
-    print("\n" + "="*60)
-    print("3. TESTING SITE SETTINGS ENDPOINTS")
-    print("="*60)
-    
-    if not token:
-        log_test("Site Settings tests", False, "No auth token available")
-        return
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    # Test 1: GET /api/admin/site
-    try:
-        resp = requests.get(f"{BASE_URL}/admin/site", headers=headers, timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if "site" in data:
-                log_test("GET /api/admin/site", True, "Site settings retrieved")
-            else:
-                log_test("GET /api/admin/site", False, "Missing 'site' in response")
-        else:
-            log_test("GET /api/admin/site", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/admin/site", False, str(e))
-    
-    # Test 2: PUT /api/admin/site
-    try:
-        resp = requests.put(f"{BASE_URL}/admin/site",
-                           headers=headers,
-                           json={
-                               "site_name": "LovePDF Test",
-                               "site_url": "https://example.com",
-                               "ga_measurement_id": "G-TEST123"
-                           },
-                           timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("ok"):
-                log_test("PUT /api/admin/site", True, "Site settings updated")
-            else:
-                log_test("PUT /api/admin/site", False, f"Unexpected response: {data}")
-        else:
-            log_test("PUT /api/admin/site", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("PUT /api/admin/site", False, str(e))
-    
-    # Test 3: Public GET /api/seo/site
-    try:
-        resp = requests.get(f"{BASE_URL}/seo/site", timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if "site" in data:
-                site = data["site"]
-                if site.get("site_name") == "LovePDF Test" and site.get("ga_measurement_id") == "G-TEST123":
-                    log_test("GET /api/seo/site (public)", True, "Site settings reflect saved values")
-                else:
-                    log_test("GET /api/seo/site (public)", False, f"Values mismatch: {site}")
-            else:
-                log_test("GET /api/seo/site (public)", False, "Missing 'site' in response")
-        else:
-            log_test("GET /api/seo/site (public)", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/seo/site (public)", False, str(e))
-
-def test_blog(token):
-    """Test blog CRUD endpoints"""
-    print("\n" + "="*60)
-    print("4. TESTING BLOG ENDPOINTS")
-    print("="*60)
-    
-    if not token:
-        log_test("Blog tests", False, "No auth token available")
-        return
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    post_id = None
-    
-    # Test 1: POST /api/admin/blog (create)
-    try:
-        resp = requests.post(f"{BASE_URL}/admin/blog",
-                            headers=headers,
-                            json={
-                                "slug": "hello-world-test",
-                                "title": "Hello World Test",
-                                "content": "<p>Test content</p>",
-                                "published": True
-                            },
-                            timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("ok") and "id" in data:
-                post_id = data["id"]
-                log_test("POST /api/admin/blog (create)", True, f"Post created with id={post_id}")
-            else:
-                log_test("POST /api/admin/blog (create)", False, f"Unexpected response: {data}")
-        else:
-            log_test("POST /api/admin/blog (create)", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("POST /api/admin/blog (create)", False, str(e))
-    
-    # Test 2: POST same slug again (should fail with 400)
-    try:
-        resp = requests.post(f"{BASE_URL}/admin/blog",
-                            headers=headers,
-                            json={
-                                "slug": "hello-world-test",
-                                "title": "Duplicate",
-                                "content": "<p>Duplicate</p>",
-                                "published": True
-                            },
-                            timeout=10)
-        
-        if resp.status_code == 400:
-            log_test("POST /api/admin/blog (duplicate slug)", True, "Correctly returned 400 for duplicate slug")
-        else:
-            log_test("POST /api/admin/blog (duplicate slug)", False, f"Expected 400, got {resp.status_code}")
-    except Exception as e:
-        log_test("POST /api/admin/blog (duplicate slug)", False, str(e))
-    
-    # Test 3: GET /api/admin/blog (list all)
-    try:
-        resp = requests.get(f"{BASE_URL}/admin/blog", headers=headers, timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if "posts" in data:
-                posts = data["posts"]
-                found = any(p.get("slug") == "hello-world-test" for p in posts)
-                if found:
-                    log_test("GET /api/admin/blog", True, f"Found created post in list ({len(posts)} posts)")
-                else:
-                    log_test("GET /api/admin/blog", False, "Created post not found in list")
-            else:
-                log_test("GET /api/admin/blog", False, "Missing 'posts' in response")
-        else:
-            log_test("GET /api/admin/blog", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/admin/blog", False, str(e))
-    
-    # Test 4: PUT /api/admin/blog/{id} (update)
-    if post_id:
-        try:
-            resp = requests.put(f"{BASE_URL}/admin/blog/{post_id}",
-                               headers=headers,
-                               json={
-                                   "slug": "hello-world-test",
-                                   "title": "Hello World Updated",
-                                   "content": "<p>Updated content</p>",
-                                   "published": True
-                               },
-                               timeout=10)
+            test_result(
+                "Kruti Dev PDF to Word - Valid non-empty .docx",
+                True,
+                f"Size: {len(docx_bytes)} bytes"
+            )
             
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ok"):
-                    log_test("PUT /api/admin/blog/{id} (update)", True, "Post updated")
+            # Extract text
+            try:
+                text = extract_docx_text(docx_bytes)
+                text_len = len(text.strip())
+                
+                test_result(
+                    "Kruti Dev PDF to Word - Non-empty text",
+                    text_len > 0,
+                    f"Extracted {text_len} characters"
+                )
+                
+                # Check for Devanagari Unicode
+                deva_count = count_devanagari(text)
+                has_deva = has_devanagari(text)
+                
+                if not has_deva:
+                    test_result(
+                        "Kruti Dev PDF to Word - Contains Devanagari (U+0900-U+097F)",
+                        False,
+                        f"No Devanagari found. Text preview: {text[:200]}"
+                    )
                 else:
-                    log_test("PUT /api/admin/blog/{id} (update)", False, f"Unexpected response: {data}")
-            else:
-                log_test("PUT /api/admin/blog/{id} (update)", False, f"Status {resp.status_code}: {resp.text}")
-        except Exception as e:
-            log_test("PUT /api/admin/blog/{id} (update)", False, str(e))
+                    test_result(
+                        "Kruti Dev PDF to Word - Contains Devanagari (U+0900-U+097F)",
+                        True,
+                        f"Found {deva_count} Devanagari characters"
+                    )
+                    print(f"   Text preview: {text[:200]}")
+                
+                # Check that ASCII gibberish is NOT present
+                ascii_gibberish = ['pfj=', 'izekf.kr', 'O;fäxr', 'budk']
+                found_gibberish = [g for g in ascii_gibberish if g in text]
+                
+                if found_gibberish:
+                    test_result(
+                        "Kruti Dev PDF to Word - No ASCII gibberish",
+                        False,
+                        f"Found ASCII gibberish: {found_gibberish}"
+                    )
+                else:
+                    test_result(
+                        "Kruti Dev PDF to Word - No ASCII gibberish",
+                        True,
+                        "No ASCII tokens like 'pfj=' or 'izekf.kr' found"
+                    )
+                
+            except Exception as e:
+                test_result(
+                    "Kruti Dev PDF to Word - Extract text",
+                    False,
+                    f"Failed to extract text: {e}"
+                )
+                
+except Exception as e:
+    test_result("Kruti Dev PDF to Word - Create/POST", False, f"Exception: {e}")
+
+# Test 2: PDF to Excel with legacy Kruti Dev
+print("\nTest 2: POST /api/pdf/pdf-to-excel with legacy Kruti Dev PDF")
+print("-" * 80)
+
+try:
+    pdf_bytes = create_kruti_dev_pdf()
+    
+    url = f"{BACKEND_URL}/api/pdf/pdf-to-excel"
+    files = {'file': ('kruti_test.pdf', io.BytesIO(pdf_bytes), 'application/pdf')}
+    response = requests.post(url, files=files, timeout=120)
+    
+    if response.status_code != 200:
+        test_result(
+            "Kruti Dev PDF to Excel - HTTP 200",
+            False,
+            f"Expected 200, got {response.status_code}: {response.text[:300]}"
+        )
     else:
-        log_test("PUT /api/admin/blog/{id} (update)", False, "No post_id available")
-    
-    # Test 5: Public GET /api/blog (list published)
-    try:
-        resp = requests.get(f"{BASE_URL}/blog", timeout=10)
+        test_result("Kruti Dev PDF to Excel - HTTP 200", True)
         
-        if resp.status_code == 200:
-            data = resp.json()
-            if "posts" in data:
-                posts = data["posts"]
-                found = any(p.get("slug") == "hello-world-test" for p in posts)
-                # Check that content field is excluded
-                has_content = any("content" in p for p in posts)
-                if found and not has_content:
-                    log_test("GET /api/blog (public list)", True, f"Published post found, content excluded ({len(posts)} posts)")
-                elif found and has_content:
-                    log_test("GET /api/blog (public list)", False, "Content field should be excluded from list")
-                else:
-                    log_test("GET /api/blog (public list)", False, "Published post not found")
-            else:
-                log_test("GET /api/blog (public list)", False, "Missing 'posts' in response")
+        # Check it's a valid .xlsx
+        xlsx_bytes = response.content
+        if len(xlsx_bytes) < 1000:
+            test_result(
+                "Kruti Dev PDF to Excel - Valid non-empty .xlsx",
+                False,
+                f"Response too small: {len(xlsx_bytes)} bytes"
+            )
         else:
-            log_test("GET /api/blog (public list)", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/blog (public list)", False, str(e))
-    
-    # Test 6: Public GET /api/blog/{slug} (detail)
-    try:
-        resp = requests.get(f"{BASE_URL}/blog/hello-world-test", timeout=10)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if "post" in data:
-                post = data["post"]
-                if post.get("title") == "Hello World Updated" and "content" in post:
-                    log_test("GET /api/blog/{slug} (public detail)", True, "Full post with updated title and content")
-                else:
-                    log_test("GET /api/blog/{slug} (public detail)", False, f"Data mismatch: {post}")
-            else:
-                log_test("GET /api/blog/{slug} (public detail)", False, "Missing 'post' in response")
-        else:
-            log_test("GET /api/blog/{slug} (public detail)", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/blog/{slug} (public detail)", False, str(e))
-    
-    # Test 7: DELETE /api/admin/blog/{id}
-    if post_id:
-        try:
-            resp = requests.delete(f"{BASE_URL}/admin/blog/{post_id}",
-                                  headers=headers,
-                                  timeout=10)
+            test_result(
+                "Kruti Dev PDF to Excel - Valid non-empty .xlsx",
+                True,
+                f"Size: {len(xlsx_bytes)} bytes"
+            )
             
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ok"):
-                    log_test("DELETE /api/admin/blog/{id}", True, "Post deleted")
-                    
-                    # Test 8: Verify public GET returns 404 after delete
-                    try:
-                        verify_resp = requests.get(f"{BASE_URL}/blog/hello-world-test", timeout=10)
-                        if verify_resp.status_code == 404:
-                            log_test("GET /api/blog/{slug} after delete", True, "Correctly returns 404")
-                        else:
-                            log_test("GET /api/blog/{slug} after delete", False, f"Expected 404, got {verify_resp.status_code}")
-                    except Exception as e:
-                        log_test("GET /api/blog/{slug} after delete", False, str(e))
+            # Extract text from cells
+            try:
+                text = extract_xlsx_text(xlsx_bytes)
+                
+                # Check for Devanagari Unicode
+                deva_count = count_devanagari(text)
+                has_deva = has_devanagari(text)
+                
+                if not has_deva:
+                    test_result(
+                        "Kruti Dev PDF to Excel - Contains Devanagari (U+0900-U+097F)",
+                        False,
+                        f"No Devanagari found. Text preview: {text[:200]}"
+                    )
                 else:
-                    log_test("DELETE /api/admin/blog/{id}", False, f"Unexpected response: {data}")
-            else:
-                log_test("DELETE /api/admin/blog/{id}", False, f"Status {resp.status_code}: {resp.text}")
-        except Exception as e:
-            log_test("DELETE /api/admin/blog/{id}", False, str(e))
+                    test_result(
+                        "Kruti Dev PDF to Excel - Contains Devanagari (U+0900-U+097F)",
+                        True,
+                        f"Found {deva_count} Devanagari characters in cells"
+                    )
+                    print(f"   Text preview: {text[:200]}")
+                
+            except Exception as e:
+                test_result(
+                    "Kruti Dev PDF to Excel - Extract text",
+                    False,
+                    f"Failed to extract text: {e}"
+                )
+                
+except Exception as e:
+    test_result("Kruti Dev PDF to Excel - Create/POST", False, f"Exception: {e}")
+
+# Test 3: PDF inspect endpoint
+print("\nTest 3: POST /api/pdf/inspect with legacy Kruti Dev PDF")
+print("-" * 80)
+
+try:
+    pdf_bytes = create_kruti_dev_pdf()
+    
+    url = f"{BACKEND_URL}/api/pdf/inspect"
+    files = {'file': ('kruti_test.pdf', io.BytesIO(pdf_bytes), 'application/pdf')}
+    response = requests.post(url, files=files, timeout=60)
+    
+    if response.status_code != 200:
+        test_result(
+            "Kruti Dev PDF inspect - HTTP 200",
+            False,
+            f"Expected 200, got {response.status_code}: {response.text[:300]}"
+        )
     else:
-        log_test("DELETE /api/admin/blog/{id}", False, "No post_id available")
-    
-    # Test 9: Verify admin blog routes require auth
-    try:
-        resp = requests.get(f"{BASE_URL}/admin/blog", timeout=10)
-        if resp.status_code == 401:
-            log_test("GET /api/admin/blog (no auth)", True, "Correctly returns 401 without token")
-        else:
-            log_test("GET /api/admin/blog (no auth)", False, f"Expected 401, got {resp.status_code}")
-    except Exception as e:
-        log_test("GET /api/admin/blog (no auth)", False, str(e))
-
-def test_seo_infra():
-    """Test sitemap.xml and robots.txt"""
-    print("\n" + "="*60)
-    print("5. TESTING SEO INFRASTRUCTURE")
-    print("="*60)
-    
-    # Test 1: GET /api/sitemap.xml
-    try:
-        resp = requests.get(f"{BASE_URL}/sitemap.xml", timeout=10)
+        test_result("Kruti Dev PDF inspect - HTTP 200", True)
         
-        if resp.status_code == 200:
-            content = resp.text
-            if '<?xml version="1.0"' in content and '<urlset' in content:
-                # Check for tool URLs
-                has_tools = '/tool/' in content
-                if has_tools:
-                    log_test("GET /api/sitemap.xml", True, "Valid XML with tool URLs")
-                else:
-                    log_test("GET /api/sitemap.xml", False, "Missing tool URLs in sitemap")
-            else:
-                log_test("GET /api/sitemap.xml", False, "Invalid XML format")
-        else:
-            log_test("GET /api/sitemap.xml", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/sitemap.xml", False, str(e))
-    
-    # Test 2: GET /api/robots.txt
-    try:
-        resp = requests.get(f"{BASE_URL}/robots.txt", timeout=10)
+        data = response.json()
+        legacy_hindi = data.get('legacy_hindi', False)
         
-        if resp.status_code == 200:
-            content = resp.text
-            has_disallow_admin = "Disallow: /admin" in content
-            has_sitemap = "Sitemap:" in content
-            if has_disallow_admin and has_sitemap:
-                log_test("GET /api/robots.txt", True, "Contains Disallow: /admin and Sitemap line")
-            else:
-                log_test("GET /api/robots.txt", False, f"Missing required content. Has admin: {has_disallow_admin}, Has sitemap: {has_sitemap}")
+        if not legacy_hindi:
+            test_result(
+                "Kruti Dev PDF inspect - legacy_hindi == true",
+                False,
+                f"Expected legacy_hindi=true, got {legacy_hindi}. Response: {data}"
+            )
         else:
-            log_test("GET /api/robots.txt", False, f"Status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log_test("GET /api/robots.txt", False, str(e))
+            test_result(
+                "Kruti Dev PDF inspect - legacy_hindi == true",
+                True,
+                f"Response: {data}"
+            )
+            
+except Exception as e:
+    test_result("Kruti Dev PDF inspect - POST", False, f"Exception: {e}")
 
-def main():
-    print("="*60)
-    print("ADMIN PANEL BACKEND API TESTS")
-    print("="*60)
-    print(f"Backend URL: {BASE_URL}")
-    print(f"Admin Email: {ADMIN_EMAIL}")
-    print("="*60)
+# Test 4: Regression - English PDF
+print("\nTest 4: REGRESSION - Plain English PDF")
+print("-" * 80)
+
+def create_english_pdf():
+    """Create a simple English text PDF"""
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font('Arial', size=12)
+    pdf.cell(0, 10, txt='This is a test document in English.', ln=True)
+    pdf.cell(0, 10, txt='It should convert to Word without issues.', ln=True)
+    pdf.cell(0, 10, txt='No Hindi or Devanagari text here.', ln=True)
+    pdf_bytes = pdf.output()
+    if isinstance(pdf_bytes, str):
+        pdf_bytes = pdf_bytes.encode('latin-1')
+    return pdf_bytes
+
+try:
+    pdf_bytes = create_english_pdf()
     
-    # Run all tests
-    token = test_auth()
-    test_seo_pages(token)
-    test_site_settings(token)
-    test_blog(token)
-    test_seo_infra()
+    # Test inspect
+    url = f"{BACKEND_URL}/api/pdf/inspect"
+    files = {'file': ('english_test.pdf', io.BytesIO(pdf_bytes), 'application/pdf')}
+    response = requests.post(url, files=files, timeout=60)
     
-    # Summary
-    print("\n" + "="*60)
-    print("TEST SUMMARY")
-    print("="*60)
-    print(f"Total: {passed + failed} tests")
-    print(f"✅ Passed: {passed}")
-    print(f"❌ Failed: {failed}")
-    print("="*60)
+    if response.status_code == 200:
+        data = response.json()
+        legacy_hindi = data.get('legacy_hindi', False)
+        
+        if legacy_hindi:
+            test_result(
+                "English PDF inspect - legacy_hindi == false",
+                False,
+                f"Expected legacy_hindi=false, got {legacy_hindi}"
+            )
+        else:
+            test_result(
+                "English PDF inspect - legacy_hindi == false",
+                True,
+                f"Response: {data}"
+            )
     
-    if failed > 0:
-        print("\nFAILED TESTS:")
-        for result in test_results:
-            if not result["success"]:
-                print(f"  - {result['name']}: {result['details']}")
-        sys.exit(1)
+    # Test pdf-to-word
+    url = f"{BACKEND_URL}/api/pdf/pdf-to-word"
+    files = {'file': ('english_test.pdf', io.BytesIO(pdf_bytes), 'application/pdf')}
+    response = requests.post(url, files=files, timeout=120)
+    
+    if response.status_code != 200:
+        test_result(
+            "English PDF to Word - HTTP 200",
+            False,
+            f"Expected 200, got {response.status_code}"
+        )
     else:
-        print("\n🎉 All tests passed!")
-        sys.exit(0)
+        test_result("English PDF to Word - HTTP 200", True)
+        
+        docx_bytes = response.content
+        text = extract_docx_text(docx_bytes)
+        
+        if 'English' not in text or len(text.strip()) < 10:
+            test_result(
+                "English PDF to Word - Valid English text",
+                False,
+                f"Text: {text[:200]}"
+            )
+        else:
+            test_result(
+                "English PDF to Word - Valid English text",
+                True,
+                f"Extracted {len(text.strip())} characters"
+            )
+            
+except Exception as e:
+    test_result("English PDF regression - POST", False, f"Exception: {e}")
 
-if __name__ == "__main__":
-    main()
+# Test 5: Health check
+print("\nTest 5: GET /api/pdf/health")
+print("-" * 80)
+
+try:
+    url = f"{BACKEND_URL}/api/pdf/health"
+    response = requests.get(url, timeout=30)
+    
+    if response.status_code != 200:
+        test_result(
+            "PDF health check - HTTP 200",
+            False,
+            f"Expected 200, got {response.status_code}"
+        )
+    else:
+        test_result("PDF health check - HTTP 200", True)
+        
+        data = response.json()
+        tools = data.get('tools', {})
+        
+        required_tools = ['soffice', 'gs', 'qpdf', 'tesseract', 'pdftoppm', 'ocrmypdf']
+        all_available = all(tools.get(t, False) for t in required_tools)
+        
+        if not all_available:
+            missing = [t for t in required_tools if not tools.get(t, False)]
+            test_result(
+                "PDF health check - All tools available",
+                False,
+                f"Missing tools: {missing}. Tools: {tools}"
+            )
+        else:
+            test_result(
+                "PDF health check - All tools available",
+                True,
+                f"All required tools available: {tools}"
+            )
+            
+except Exception as e:
+    test_result("PDF health check - GET", False, f"Exception: {e}")
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+print("\n" + "=" * 80)
+print("TEST SUMMARY")
+print("=" * 80)
+print(f"Total tests: {total_tests}")
+print(f"✅ Passed: {passed_tests}")
+print(f"❌ Failed: {failed_tests}")
+print(f"Success rate: {(passed_tests/total_tests*100):.1f}%")
+print("=" * 80)
+
+if failed_tests == 0:
+    print("\n🎉 ALL TESTS PASSED!")
+    sys.exit(0)
+else:
+    print(f"\n⚠️  {failed_tests} TEST(S) FAILED")
+    sys.exit(1)

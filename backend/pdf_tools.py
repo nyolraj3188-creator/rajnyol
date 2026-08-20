@@ -87,6 +87,23 @@ async def health():
     return {"ok": True, "tools": tools}
 
 
+@router.post("/inspect")
+async def inspect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Report whether a PDF uses a legacy (non-Unicode) Devanagari font so the
+    client can convert its ASCII-mapped text to Unicode before displaying/editing."""
+    job = _new_job()
+    try:
+        src = await _save_upload(file, job)
+        legacy = _is_legacy_hindi(src)
+        ratio = _devanagari_ratio(src)
+        fonts = sorted(_pdf_font_names(src))[:20]
+        _cleanup(job)
+        return JSONResponse({"legacy_hindi": legacy, "devanagari_ratio": ratio, "fonts": fonts})
+    except Exception:
+        _cleanup(job)
+        return JSONResponse({"legacy_hindi": False, "devanagari_ratio": 0.0, "fonts": []})
+
+
 # ---------- Office / HTML -> PDF ----------
 @router.post("/office-to-pdf")
 async def office_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -142,6 +159,7 @@ def _ocr_if_scanned(src: Path, job: Path, lang: str = "eng") -> Path:
     if _has_text_layer(src):
         return src
     _require_ocr_tools()
+    lang = _sanitize_lang(lang)
     import ocrmypdf
     ocred = job / (src.stem + "_ocred.pdf")
     try:
@@ -153,26 +171,73 @@ def _ocr_if_scanned(src: Path, job: Path, lang: str = "eng") -> Path:
     return src
 
 
-def _scanned_pdf_to_docx(src: Path, job: Path, out: Path, lang: str):
-    """OCR a scanned PDF and build an editable Word document from the recognized text."""
-    import re
+def _run_ocr(src: Path, out_pdf: Path, lang: str, sidecar: Path = None):
+    """Run ocrmypdf with image-cleaning (unpaper) + deskew for better accuracy
+    on legacy/scanned Hindi forms. Falls back to a plain run if cleaning fails."""
     _require_ocr_tools()
     import ocrmypdf
+    kw = dict(force_ocr=True, language=_sanitize_lang(lang), optimize=0,
+              progress_bar=False, deskew=True)
+    if shutil.which("unpaper"):
+        kw["clean"] = True
+    if sidecar is not None:
+        kw["sidecar"] = str(sidecar)
+    try:
+        ocrmypdf.ocr(str(src), str(out_pdf), **kw)
+    except Exception:
+        kw.pop("clean", None)
+        kw.pop("deskew", None)
+        ocrmypdf.ocr(str(src), str(out_pdf), **kw)
+
+
+def _clean_ocr_line(line: str) -> str:
+    """Tidy up OCR noise from dotted/underscore 'fill-in' leaders in forms."""
+    import re
+    line = re.sub(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f\ufffe\uffff]", "", line)
+    line = re.sub(r"[.\u2026·]{4,}", " …… ", line)   # dotted leaders
+    line = re.sub(r"[_=~—–-]{4,}", " —— ", line)      # underline / dash leaders
+    line = re.sub(r"[<>«»]{2,}", " ", line)            # stray arrows OCR invents
+    line = re.sub(r"[ \t]{2,}", " ", line)
+    return line.strip()
+
+
+def _looks_like_noise(line: str) -> bool:
+    """Drop lines that are essentially punctuation/symbol garbage (no real words)."""
+    import re
+    s = re.sub(r"\s", "", line)
+    if len(s) < 2:
+        return True
+    meaningful = sum(1 for c in s if c.isalnum() or "\u0900" <= c <= "\u097f")
+    # keep only if a reasonable share of the line is letters/digits
+    return meaningful < max(2, int(0.35 * len(s)))
+
+
+def _force_ocr_pdf(src: Path, job: Path, lang: str) -> Path:
+    """Return an OCR'd copy of the PDF (real text layer). Used for legacy-font
+    Hindi PDFs where the existing text layer is ASCII-mapped gibberish."""
+    out = job / (src.stem + "_forced_ocr.pdf")
+    try:
+        _run_ocr(src, out, lang)
+    except Exception:
+        return src
+    return out if out.exists() else src
+
+
+def _scanned_pdf_to_docx(src: Path, job: Path, out: Path, lang: str):
+    """OCR a scanned/legacy PDF and build an editable Word document from the text."""
     from docx import Document
     sidecar = job / "ocr_text.txt"
     ocred = job / (src.stem + "_ocred.pdf")
-    ocrmypdf.ocr(str(src), str(ocred), force_ocr=True, language=lang,
-                 sidecar=str(sidecar), optimize=0, progress_bar=False)
+    _run_ocr(src, ocred, lang, sidecar=sidecar)
     text = sidecar.read_text(encoding="utf-8", errors="ignore") if sidecar.exists() else ""
     if not text.strip():
         raise HTTPException(422, "No readable text found in this scanned PDF.")
-    illegal = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f\ufffe\uffff]")
     doc = Document()
     pages = text.split("\f")
     for pi, page in enumerate(pages):
         for line in page.splitlines():
-            clean = illegal.sub("", line).strip()
-            if clean:
+            clean = _clean_ocr_line(line)
+            if clean and not _looks_like_noise(clean):
                 doc.add_paragraph(clean)
         if pi < len(pages) - 1 and page.strip():
             doc.add_page_break()
@@ -255,6 +320,136 @@ def _normalize_office(src: Path, ext: str, job: Path) -> Path:
         return src
 
 
+def _tess_langs() -> set:
+    """Languages available to the local Tesseract install."""
+    try:
+        proc = subprocess.run(["tesseract", "--list-langs"], capture_output=True, timeout=30)
+        lines = proc.stdout.decode(errors="ignore").splitlines()[1:]
+        return {ln.strip() for ln in lines if ln.strip()}
+    except Exception:
+        return set()
+
+
+def _sanitize_lang(lang: str) -> str:
+    """Keep only languages actually installed (e.g. 'hin+eng'); default to eng."""
+    avail = _tess_langs()
+    req = [ln for ln in (lang or "eng").split("+") if ln]
+    keep = [ln for ln in req if (not avail or ln in avail)]
+    return "+".join(keep) if keep else "eng"
+
+
+def _docx_text_len(path: Path) -> int:
+    """Total non-whitespace characters in a .docx (used to catch 'valid but empty' output)."""
+    try:
+        from docx import Document
+        doc = Document(str(path))
+        return sum(len(p.text.strip()) for p in doc.paragraphs)
+    except Exception:
+        return 0
+
+
+def _text_pdf_to_docx(src: Path, job: Path, out: Path):
+    """Build a Unicode-safe .docx directly from the PDF text layer. This preserves
+    non-Latin scripts (e.g. Hindi/Devanagari) that pdf2docx sometimes drops."""
+    import re
+    import pdfplumber
+    from docx import Document
+    illegal = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f\ufffe\uffff]")
+    doc = Document()
+    any_text = False
+    with pdfplumber.open(str(src)) as pdf:
+        n = len(pdf.pages)
+        for pi, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                clean = illegal.sub("", line).strip()
+                if clean:
+                    doc.add_paragraph(clean)
+                    any_text = True
+            if pi < n - 1:
+                doc.add_page_break()
+    if not any_text:
+        raise HTTPException(422, "No extractable text found in this PDF.")
+    doc.save(str(out))
+
+
+# Legacy (non-Unicode) Devanagari fonts store Hindi as ASCII-mapped glyph codes,
+# so the extracted "text" is gibberish like: O;fäxr :i ls  ekg@o"kksZa ls ...
+# We detect these and OCR the rendered pages instead (which yields real Unicode).
+LEGACY_HINDI_FONTS = (
+    "kruti", "krutidev", "devlys", "dev-lys", "dev lys", "chanakya", "shusha",
+    "susha", "shivaji", "agra", "walkman", "shree", "richa", "aakruti",
+    "sanskrit99", "amanuj", "dvb", "dvbw", "dv-ttyogesh", "yogesh", "surekh",
+    "millennium", "janmang", "naidunia", "webdunia",
+)
+
+
+def _pdf_font_names(src: Path) -> set:
+    names = set()
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(src)) as pdf:
+            for page in pdf.pages[:5]:
+                for ch in page.chars:
+                    fn = ch.get("fontname")
+                    if fn:
+                        names.add(fn)
+    except Exception:
+        pass
+    return names
+
+
+def _is_legacy_hindi(src: Path) -> bool:
+    """True if the PDF uses a known legacy (non-Unicode) Devanagari font."""
+    blob = " ".join(_pdf_font_names(src)).lower()
+    return any(tok in blob for tok in LEGACY_HINDI_FONTS)
+
+
+def _devanagari_ratio(src: Path) -> float:
+    """Fraction of non-space characters in the text layer that are real
+    Unicode Devanagari (U+0900–U+097F)."""
+    total = deva = 0
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(src)) as pdf:
+            for page in pdf.pages[:5]:
+                for c in (page.extract_text() or ""):
+                    if c.isspace():
+                        continue
+                    total += 1
+                    if "\u0900" <= c <= "\u097f":
+                        deva += 1
+    except Exception:
+        return 0.0
+    return (deva / total) if total else 0.0
+
+
+def _kruti_pdf_to_docx(src: Path, job: Path, out: Path) -> bool:
+    """Build a .docx from a legacy Kruti Dev text layer, converting each line to
+    proper Unicode Devanagari. Clean and noise-free (no OCR). Returns True only
+    if meaningful Devanagari was produced."""
+    import pdfplumber
+    from docx import Document
+    from krutidev import kruti_to_unicode, devanagari_count
+    doc = Document()
+    total_deva = 0
+    with pdfplumber.open(str(src)) as pdf:
+        n = len(pdf.pages)
+        for pi, page in enumerate(pdf.pages):
+            raw = page.extract_text() or ""
+            for line in raw.splitlines():
+                conv = kruti_to_unicode(line)
+                total_deva += devanagari_count(conv)
+                if conv.strip():
+                    doc.add_paragraph(conv)
+            if pi < n - 1:
+                doc.add_page_break()
+    if total_deva < 5:
+        return False
+    doc.save(str(out))
+    return True
+
+
 # ---------- PDF -> Word ----------
 @router.post("/pdf-to-word")
 async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File(...), lang: str = Form("eng")):
@@ -263,23 +458,57 @@ async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File
     try:
         src = await _save_upload(file, job)
         out = job / (src.stem + ".docx")
-        if _has_text_layer(src):
+        lang = _sanitize_lang(lang)
+        has_text = _has_text_layer(src)
+        # Legacy non-Unicode Hindi font (Kruti Dev / DevLys / Chanakya ...) OR a
+        # text layer that has almost no real Devanagari while Hindi was requested:
+        # the extracted text would be ASCII-mapped gibberish, so OCR the rendered
+        # pages to recover proper Unicode Devanagari.
+        legacy_hindi = _is_legacy_hindi(src)
+        deva_ratio = _devanagari_ratio(src) if has_text else 0.0
+
+        if legacy_hindi:
+            # Legacy non-Unicode Hindi font (Kruti Dev / DevLys / Chanakya ...):
+            # the text layer is ASCII-mapped, so convert it deterministically to
+            # Unicode (clean, no OCR noise); fall back to OCR only if that fails.
+            made = False
+            try:
+                made = _kruti_pdf_to_docx(src, job, out)
+            except Exception:
+                made = False
+            if not made:
+                out.unlink(missing_ok=True)
+                _scanned_pdf_to_docx(src, job, out, _sanitize_lang("hin+eng"))
+        elif has_text and "hin" in lang and deva_ratio < 0.15:
+            # Hindi requested but the text layer has ~no Devanagari -> OCR.
+            _scanned_pdf_to_docx(src, job, out, _sanitize_lang(lang))
+        elif has_text:
+            # 1) pdf2docx — best layout fidelity for Latin text
             try:
                 cv = Converter(str(src))
                 cv.convert(str(out))
                 cv.close()
             except Exception:
                 out.unlink(missing_ok=True)
-            if not out.exists() or not _docx_is_valid(out):
+            # 2) if pdf2docx failed OR produced an (almost) empty doc (common with
+            #    Hindi/Devanagari), rebuild a Unicode-safe docx from the text layer
+            if not out.exists() or not _docx_is_valid(out) or _docx_text_len(out) < 5:
                 out.unlink(missing_ok=True)
-                _scanned_pdf_to_docx(src, job, out, lang)
+                try:
+                    _text_pdf_to_docx(src, job, out)
+                except Exception:
+                    out.unlink(missing_ok=True)
+            # 3) last resort: OCR (handles legacy/non-Unicode font encodings)
+            if not out.exists() or not _docx_is_valid(out) or _docx_text_len(out) < 5:
+                out.unlink(missing_ok=True)
+                _scanned_pdf_to_docx(src, job, out, _sanitize_lang("hin+eng"))
         else:
             _scanned_pdf_to_docx(src, job, out, lang)
         if not out.exists() or not _docx_is_valid(out):
             raise HTTPException(500, "Conversion produced an unreadable document. Please try another file.")
         # Normalize through LibreOffice so the .docx opens cleanly in MS Word.
         final = _normalize_office(out, "docx", job)
-        if _docx_is_valid(final):
+        if _docx_is_valid(final) and _docx_text_len(final) >= max(0, _docx_text_len(out) - 2):
             out = final
         return _respond(out, src.stem + ".docx", "docx", job, background_tasks)
     except HTTPException:
@@ -290,13 +519,22 @@ async def pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File
 
 # ---------- PDF -> Excel ----------
 @router.post("/pdf-to-excel")
-async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...), lang: str = Form("eng")):
     import pdfplumber
     from openpyxl import Workbook
     job = _new_job()
     try:
         src = await _save_upload(file, job)
-        src = _ocr_if_scanned(src, job)
+        lang = _sanitize_lang(lang)
+        # Legacy (non-Unicode) Hindi font -> convert the ASCII-mapped text layer to
+        # Unicode Devanagari per cell/line (clean, no OCR). Otherwise OCR only if
+        # the PDF is scanned (image-only).
+        convert_kruti = _is_legacy_hindi(src)
+        if not convert_kruti:
+            src = _ocr_if_scanned(src, job, lang)
+        conv = None
+        if convert_kruti:
+            from krutidev import kruti_to_unicode as conv
         wb = Workbook()
         wb.remove(wb.active)
         found = False
@@ -308,12 +546,12 @@ async def pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = Fil
                     found = True
                     for tbl in tables:
                         for row in tbl:
-                            ws.append([("" if c is None else c) for c in row])
+                            ws.append([("" if c is None else (conv(c) if conv else c)) for c in row])
                         ws.append([])
                 else:
                     text = page.extract_text() or ""
                     for line in text.splitlines():
-                        ws.append([line])
+                        ws.append([conv(line) if conv else line])
         if not wb.sheetnames:
             wb.create_sheet("Sheet1")
         out = job / (src.stem + ".xlsx")
@@ -366,6 +604,7 @@ async def ocr_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...
     job = _new_job()
     try:
         _require_ocr_tools()
+        lang = _sanitize_lang(lang)
         src = await _save_upload(file, job)
         out = job / (src.stem + "_ocr.pdf")
         try:
